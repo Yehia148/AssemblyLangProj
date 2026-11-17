@@ -601,28 +601,300 @@ bool execute_b(uint16_t hw, uint16_t hw2, bool wide,
     return false;
 }
 // Shared instruction dispatch: Member A and B extend the starter cases.
+enum class MemMode {
+    None, Literal, Register, Immediate, Stack, Multiple, Push, Pop
+};
+
+struct MemOp {
+    MemMode mode = MemMode::None;
+    const char* name = "";
+    unsigned rd = 0, rn = 0, rm = 0, offset = 0, list = 0;
+    int size = 4;
+    bool load = false, sign = false;
+};
+
+MemOp decode_memory(uint16_t hw) {
+    MemOp m;
+    if ((hw & 0xf800) == 0x4800) {
+        m.mode = MemMode::Literal; m.name = "ldr"; m.load = true;
+        m.rd = (hw >> 8) & 7; m.rn = 15; m.offset = (hw & 255) * 4u;
+    } else if ((hw & 0xf000) == 0x5000) {
+        static const char* names[] = {
+            "str", "strh", "strb", "ldrsb", "ldr", "ldrh", "ldrb", "ldrsh"
+        };
+        static const int sizes[] = {4, 2, 1, 1, 4, 2, 1, 2};
+        unsigned op = (hw >> 9) & 7;
+        m.mode = MemMode::Register; m.name = names[op]; m.size = sizes[op];
+        m.load = op >= 3; m.sign = op == 3 || op == 7;
+        m.rd = hw & 7; m.rn = (hw >> 3) & 7; m.rm = (hw >> 6) & 7;
+    } else if ((hw & 0xe000) == 0x6000 || (hw & 0xf000) == 0x8000) {
+        m.mode = MemMode::Immediate; m.load = (hw & 0x0800) != 0;
+        m.size = (hw & 0xf000) == 0x8000 ? 2 : ((hw & 0x1000) ? 1 : 4);
+        m.name = m.size == 4 ? (m.load ? "ldr" : "str") :
+                 m.size == 2 ? (m.load ? "ldrh" : "strh") : (m.load ? "ldrb" : "strb");
+        m.rd = hw & 7; m.rn = (hw >> 3) & 7; m.offset = ((hw >> 6) & 31) * m.size;
+    } else if ((hw & 0xf000) == 0x9000) {
+        m.mode = MemMode::Stack; m.load = (hw & 0x0800) != 0;
+        m.name = m.load ? "ldr" : "str"; m.rn = 13;
+        m.rd = (hw >> 8) & 7; m.offset = (hw & 255) * 4u;
+    } else if ((hw & 0xf600) == 0xb400) {
+        m.load = (hw & 0x0800) != 0;
+        m.mode = m.load ? MemMode::Pop : MemMode::Push;
+        m.name = m.load ? "pop" : "push"; m.rn = 13; m.list = hw & 255;
+        if (hw & 0x0100) m.list |= 1u << (m.load ? 15 : 14);
+    } else if ((hw & 0xf000) == 0xc000) {
+        m.mode = MemMode::Multiple; m.load = (hw & 0x0800) != 0;
+        m.name = m.load ? "ldmia" : "stmia"; m.rn = (hw >> 8) & 7; m.list = hw & 255;
+    }
+    return m;
+}
+
+bool execute_a(uint16_t hw, bool wide, uint32_t pc, uint32_t& next) {
+    if (wide) return false;
+    MemOp m = decode_memory(hw);
+    if (m.mode == MemMode::None) return false;
+
+    // Multiple transfers visit registers in ascending order.
+    if (m.mode == MemMode::Multiple || m.mode == MemMode::Push || m.mode == MemMode::Pop) {
+        if (!m.list) fault("UNDEFINED");
+
+        unsigned count = 0;
+        for (unsigned i = 0; i < 16; ++i)
+            if (m.list & (1u << i)) ++count;
+
+        const uint32_t base = r[m.rn];
+        uint32_t addr = m.mode == MemMode::Push ? base - 4u * count : base;
+        const uint32_t start = addr;
+
+        for (unsigned i = 0; i < 16; ++i) {
+            if (!(m.list & (1u << i))) continue;
+
+            if (m.load) {
+                uint32_t value = read_mem(addr, 4);
+
+                if (i == 15) {
+                    if (!(value & 1u)) fault("INVSTATE");
+                    next = value & ~1u;
+                } else r[i] = value;
+
+            } else write_mem(addr, r[i], 4);
+
+            addr += 4u;
+        }
+
+        if (m.mode == MemMode::Push) r[13] = start;
+        else if (m.mode == MemMode::Pop) r[13] = addr;
+        else if (!m.load || !(m.list & (1u << m.rn))) r[m.rn] = addr;
+
+        return true;
+    }
+
+    uint32_t addr = m.mode == MemMode::Literal ? ((pc + 4u) & ~3u) : r[m.rn];
+    addr += m.mode == MemMode::Register ? r[m.rm] : m.offset;
+
+    if (m.load) {
+        uint32_t value = read_mem(addr, m.size);
+
+        if (m.sign && m.size == 1 && (value & 0x80u))
+            value |= 0xffffff00u;
+
+        if (m.sign && m.size == 2 && (value & 0x8000u))
+            value |= 0xffff0000u;
+
+        r[m.rd] = value;
+
+    } else write_mem(addr, r[m.rd], m.size);
+
+    return true;
+}
+
+// Member A: disassembly helper functions.
+
+string reg_name(unsigned n) {
+    if (n == 13) return "sp";
+    if (n == 14) return "lr";
+    if (n == 15) return "pc";
+    if (n == 11) return "fp";
+    if (n == 12) return "ip";
+    if (n == 10) return "sl";
+    return "r" + to_string(n);
+}
+
+string immediate(unsigned n) {
+    return "#" + to_string(n);
+}
+
+string hex_address(uint32_t n) {
+    char buf[16];
+    snprintf(buf, sizeof buf, "%x", unsigned(n));
+    return buf;
+}
+
+string register_list(unsigned bits) {
+    string s = "{";
+
+    for (unsigned i = 0; i < 16; ++i) {
+        if (!(bits & (1u << i))) continue;
+        if (s.size() > 1) s += ", ";
+        s += reg_name(i);
+    }
+
+    return s + "}";
+}
+
+// Member A: instruction decoder for CP1.
+
+string decode_thumb(uint16_t hw, uint16_t hw2, bool wide, uint32_t pc) {
+    if (wide) {
+        if ((hw & 0xf800) != 0xf000 || (hw2 & 0xd000) != 0xd000)
+            return ".word";
+
+        unsigned s = (hw >> 10) & 1, j1 = (hw2 >> 13) & 1, j2 = (hw2 >> 11) & 1;
+
+        uint32_t offset = (s << 24) | ((1u ^ j1 ^ s) << 23) |
+                          ((1u ^ j2 ^ s) << 22) |
+                          ((hw & 0x3ffu) << 12) |
+                          ((hw2 & 0x7ffu) << 1);
+
+        if (s) offset |= 0xfe000000u;
+
+        return "bl " + hex_address(pc + 4u + offset);
+    }
+
+    const string rd = reg_name(hw & 7);
+    const string rn = reg_name((hw >> 3) & 7);
+    const string rm = reg_name((hw >> 6) & 7);
+    const string dest8 = reg_name((hw >> 8) & 7);
+
+    if ((hw & 0xe000) == 0 && (hw & 0x1800) != 0x1800) {
+        unsigned type = (hw >> 11) & 3, amount = (hw >> 6) & 31;
+
+        if (type == 0 && !amount)
+            return "movs " + rd + ", " + rn;
+
+        if (!amount) amount = 32;
+
+        const char* names[] = {"lsls", "lsrs", "asrs"};
+
+        return string(names[type]) + " " + rd + ", " + rn + ", " + immediate(amount);
+    }
+
+    if ((hw & 0xf800) == 0x1800)
+        return string(hw & 0x0200 ? "subs " : "adds ") + rd + ", " + rn + ", " +
+               (hw & 0x0400 ? immediate((hw >> 6) & 7) : rm);
+
+    if ((hw & 0xe000) == 0x2000) {
+        const char* names[] = {"movs", "cmp", "adds", "subs"};
+
+        return string(names[(hw >> 11) & 3]) + " " + dest8 + ", " + immediate(hw & 255);
+    }
+
+    if ((hw & 0xfc00) == 0x4000) {
+        const char* names[] = {
+            "ands", "eors", "lsls", "lsrs", "asrs", "adcs", "sbcs", "rors",
+            "tst", "negs", "cmp", "cmn", "orrs", "muls", "bics", "mvns"
+        };
+
+        return string(names[(hw >> 6) & 15]) + " " + rd + ", " + rn;
+    }
+
+    if (hw == 0x46c0 || hw == 0xbf00) return "nop";
+
+    if ((hw & 0xfc00) == 0x4400) {
+        unsigned op = (hw >> 8) & 3;
+
+        string src = reg_name((hw >> 3) & 15);
+        string dst = reg_name((hw & 7) | ((hw >> 4) & 8));
+
+        if (op == 3) {
+            if (hw & 7) return ".short";
+            return string(hw & 0x80 ? "blx " : "bx ") + src;
+        }
+
+        const char* names[] = {"add", "cmp", "mov"};
+
+        return string(names[op]) + " " + dst + ", " + src;
+    }
+
+    MemOp m = decode_memory(hw);
+
+    if (m.mode == MemMode::Push || m.mode == MemMode::Pop)
+        return string(m.name) + " " + register_list(m.list);
+
+    if (m.mode == MemMode::Multiple)
+        return string(m.name) + " " + reg_name(m.rn) +
+               (m.load && (m.list & (1u << m.rn)) ? "" : "!") + ", " + register_list(m.list);
+
+    if (m.mode != MemMode::None)
+        return string(m.name) + " " + reg_name(m.rd) + ", [" + reg_name(m.rn) + ", " +
+               (m.mode == MemMode::Register ? reg_name(m.rm) : immediate(m.offset)) + "]";
+
+    if ((hw & 0xf000) == 0xa000)
+        return "add " + dest8 + ", " + (hw & 0x0800 ? "sp" : "pc") + ", " +
+               immediate((hw & 255) * 4u);
+
+    if ((hw & 0xff00) == 0xb000)
+        return string(hw & 0x80 ? "sub sp, " : "add sp, ") +
+               immediate((hw & 127) * 4u);
+
+    if ((hw & 0xff00) == 0xb200) {
+        const char* names[] = {"sxth", "sxtb", "uxth", "uxtb"};
+        return string(names[(hw >> 6) & 3]) + " " + rd + ", " + rn;
+    }
+
+    if ((hw & 0xffc0) == 0xba00)
+        return "rev " + rd + ", " + rn;
+
+    if ((hw & 0xff00) == 0xdf00)
+        return "svc " + to_string(hw & 255);
+
+    if ((hw & 0xf000) == 0xd000) {
+        const char* names[] = {
+            "beq", "bne", "bcs", "bcc", "bmi", "bpl", "bvs", "bvc",
+            "bhi", "bls", "bge", "blt", "bgt", "ble"
+        };
+
+        unsigned cond = (hw >> 8) & 15;
+
+        if (cond >= 14) return ".short";
+
+        int off = hw & 255;
+        if (off & 128) off -= 256;
+
+        return string(names[cond]) + " " + hex_address(pc + 4u + uint32_t(off * 2));
+    }
+
+    if ((hw & 0xf800) == 0xe000) {
+        int off = hw & 2047;
+        if (off & 1024) off -= 2048;
+
+        return "b " + hex_address(pc + 4u + uint32_t(off * 2));
+    }
+
+    return ".short";
+}
+
+// Shared instruction dispatch: integrate Members A, B and C.
+
 void execute_instruction(uint16_t hw, uint16_t hw2, bool wide,
                          uint32_t pc, uint32_t& next)
 {
-        if (execute_b(hw, hw2, wide, pc, next))
-        return;
-    if (wide) {
-        (void)hw2;
-        fault("UNDEFINED"); // Member B TODO: BL
-    } else if ((hw & 0xf800) == 0x2000) {
-        unsigned rd = (hw >> 8) & 7;
-        r[rd] = hw & 0xff;
-        set_nz(r[rd]);
-    } else if ((hw & 0xf800) == 0xe000) {
+    if (execute_a(hw, wide, pc, next)) return;
+    if (execute_b(hw, hw2, wide, pc, next)) return;
+
+    if (wide) fault("UNDEFINED");
+
+    else if ((hw & 0xf800) == 0xe000) {
         int32_t off = hw & 0x7ff;
         if (off & 0x400) off -= 0x800;
         next = pc + 4 + off * 2;
+
     } else if ((hw & 0xff00) == 0xdf00) {
         svc(hw & 0xff);
+
     } else if (hw == 0xbf00) {
+        // NOP
     } else {
-        // Member A: loads/stores, PUSH/POP, LDM/STM.
-        // Member B: other arithmetic/logic/shifts/branches.
         fault("UNDEFINED");
     }
 }
@@ -648,8 +920,91 @@ void step()
 // Member A replaces this stub with the actual disassembly listing.
 
 int disassemble() {
-    fprintf(stderr, "--disasm: waiting for Member A's decoder/disassembler\n");
-    return 2;
+    for (const TextRange& range : text_ranges) {
+        vector<uint32_t> literals;
+
+        for (uint32_t pc = range.start; pc + 1u < range.end;) {
+
+            if (find(literals.begin(), literals.end(), pc) != literals.end()
+                && range.end - pc >= 4) {
+                pc += 4;
+                continue;
+            }
+
+            uint16_t hw = uint16_t(read_mem(pc, 2));
+            bool wide = (hw >> 11) >= 0x1d;
+
+            MemOp m = decode_memory(hw);
+
+            if (!wide && m.mode == MemMode::Literal) {
+                uint32_t target = ((pc + 4u) & ~3u) + m.offset;
+
+                if (target > pc && target >= range.start &&
+                    target < range.end && range.end - target >= 4)
+                    literals.push_back(target);
+            }
+
+            pc += wide ? 4 : 2;
+        }
+
+        for (uint32_t pc = range.start; pc < range.end;) {
+
+            if (find(literals.begin(), literals.end(), pc) != literals.end()
+                && range.end - pc >= 4) {
+
+                uint32_t word = read_mem(pc, 4);
+
+                printf("%08x: %08x .word 0x%08x\n",
+                       unsigned(pc), unsigned(word), unsigned(word));
+
+                pc += 4;
+                continue;
+            }
+
+            if (range.end - pc < 2) {
+                unsigned byte = read_mem(pc, 1);
+
+                printf("%08x: %02x .byte 0x%02x\n",
+                       unsigned(pc), byte, byte);
+
+                ++pc;
+                continue;
+            }
+
+            uint16_t hw = uint16_t(read_mem(pc, 2));
+
+            if ((hw >> 11) >= 0x1d && range.end - pc < 4) {
+
+                printf("%08x: %04x .short 0x%04x\n",
+                       unsigned(pc), unsigned(hw), unsigned(hw));
+
+                pc += 2;
+                continue;
+            }
+
+            bool wide = (hw >> 11) >= 0x1d && range.end - pc >= 4;
+            uint16_t hw2 = wide ? uint16_t(read_mem(pc + 2, 2)) : 0;
+
+            string decoded = decode_thumb(hw, hw2, wide, pc);
+
+            printf("%08x: %04x", unsigned(pc), unsigned(hw));
+
+            if (wide) printf("%04x", unsigned(hw2));
+
+            if (decoded == ".short")
+                printf(" .short 0x%04x\n", unsigned(hw));
+
+            else if (decoded == ".word")
+                printf(" .word 0x%08x\n", unsigned(hw) << 16 | unsigned(hw2));
+
+            else
+                printf(" %s\n", decoded.c_str());
+
+            pc += wide ? 4 : 2;
+        }
+    }
+
+    return 0;
 }
 
 bool parse_number(const char* s, uint64_t& out) {

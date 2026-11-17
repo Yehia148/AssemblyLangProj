@@ -92,9 +92,9 @@ rangedone:
 .ltorg
 
 .section .rodata
-firstmsg: .asciz "first number: "
-lastmsg:  .asciz "last number: "
-stepmsg:  .asciz "step: "
-countmsg: .asciz "count = "
-summsg:   .asciz " sum = "
-errormsg: .asciz "step has to be postive"
+firstmsg: .asciz "Enter first value: "
+lastmsg:  .asciz "Enter last value: "
+stepmsg:  .asciz "Enter step: "
+countmsg: .asciz "Count = "
+summsg:   .asciz "\nSum = "
+errormsg: .asciz "Step must be positive."
