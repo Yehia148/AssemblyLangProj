@@ -159,8 +159,107 @@ void reset()
     r[14] = 0xFFFFFFFFu;
 }
 
-void set_nz(uint32_t x) { N = x >> 31; Z = (x == 0); }
+void set_nz(uint32_t x) { N = x >> 31; Z = (x == 0); } 
+uint32_t add_with_carry(uint32_t a, uint32_t b, uint32_t carry)
+{
+    uint64_t sum = uint64_t(a) + uint64_t(b) + carry;
+    uint32_t result = uint32_t(sum);
 
+    set_nz(result);
+    C = int(sum >> 32);
+    V = int((~(a ^ b) & (a ^ result)) >> 31);
+
+    return result;
+}
+uint32_t subtract(uint32_t a, uint32_t b)
+{
+    return add_with_carry(a, ~b, 1);
+}
+bool condition_passed(unsigned condition)
+{
+    switch (condition) {
+        case 0:  return Z == 1;
+        case 1:  return Z == 0;
+        case 2:  return C == 1;
+        case 3:  return C == 0;
+        case 4:  return N == 1;
+        case 5:  return N == 0;
+        case 6:  return V == 1;
+        case 7:  return V == 0;
+        case 8:  return C == 1 && Z == 0;
+        case 9:  return C == 0 || Z == 1;
+        case 10: return N == V;
+        case 11: return N != V;
+        case 12: return Z == 0 && N == V;
+        case 13: return Z == 1 || N != V;
+        default:
+            fault("UNDEFINED");
+            return false;
+    }
+uint32_t shift_value(uint32_t value, unsigned type, unsigned amount)
+{
+    uint32_t result = value;
+
+    if (amount == 0) {
+        set_nz(result);
+        return result;
+    }
+
+    if (type == 0) { 
+        if (amount < 32) {
+            C = (value >> (32 - amount)) & 1;
+            result = value << amount;
+        } else {
+            C = 0;
+            if (amount == 32)
+                C = value & 1;
+            result = 0;
+        }
+    }
+
+    else if (type == 1) { 
+        if (amount < 32) {
+            C = (value >> (amount - 1)) & 1;
+            result = value >> amount;
+        } else {
+            C = 0;
+            if (amount == 32)
+                C = value >> 31;
+            result = 0;
+        }
+    }
+
+    else if (type == 2) { 
+        bool negative = (value >> 31) != 0;
+
+        if (amount < 32) {
+            C = (value >> (amount - 1)) & 1;
+            result = value >> amount;
+
+            if (negative)
+                result |= 0xffffffffu << (32 - amount);
+        } else {
+            C = negative;
+            result = 0;
+
+            if (negative)
+                result = 0xffffffffu;
+        }
+    }
+
+    else if (type == 3) { 
+        unsigned rotation = amount % 32;
+
+        if (rotation != 0)
+            result = (value >> rotation) |
+                     (value << (32 - rotation));
+
+        C = result >> 31;
+    }
+
+    set_nz(result);
+    return result;
+}
 deque<int> pending_input;
 int get_byte() {
     if (pending_input.empty()) return getchar();
@@ -245,11 +344,267 @@ uint16_t fetch_halfword(uint32_t addr) {
     if (!mem_ptr(addr) || !mem_ptr(addr + 1u)) fault_at("BUS", addr);
     return uint16_t(read_mem(addr, 2));
 }
+bool execute_b(uint16_t hw, uint16_t hw2, bool wide,
+               uint32_t pc, uint32_t& next)
+{
+    if (wide) {
+        if ((hw & 0xf800) != 0xf000)
+            return false;
 
+        if ((hw2 & 0xd000) != 0xd000)
+            return false;
+
+        unsigned sign = (hw >> 10) & 1;
+        unsigned j1 = (hw2 >> 13) & 1;
+        unsigned j2 = (hw2 >> 11) & 1;
+        unsigned i1 = 1 ^ (j1 ^ sign);
+        unsigned i2 = 1 ^ (j2 ^ sign);
+
+        uint32_t bits = (sign << 24) |
+                        (i1 << 23) |
+                        (i2 << 22) |
+                        ((hw & 0x3ff) << 12) |
+                        ((hw2 & 0x7ff) << 1);
+
+        int32_t offset = int32_t(bits);
+
+        if (sign == 1)
+            offset -= 0x02000000;
+
+        r[14] = (pc + 4u) | 1u;
+        next = pc + 4u + uint32_t(offset);
+
+        return true;
+    }
+
+    if ((hw & 0xe000) == 0x0000 &&
+        (hw & 0x1800) != 0x1800) {
+        unsigned type = (hw >> 11) & 3;
+        unsigned amount = (hw >> 6) & 31;
+        unsigned source = (hw >> 3) & 7;
+        unsigned destination = hw & 7;
+
+        if (type != 0 && amount == 0)
+            amount = 32;
+
+        r[destination] = shift_value(r[source], type, amount);
+
+        return true;
+    }
+
+    if ((hw & 0xf800) == 0x1800) {
+        unsigned destination = hw & 7;
+        unsigned source = (hw >> 3) & 7;
+        unsigned operand = (hw >> 6) & 7;
+
+        uint32_t value;
+
+        if (hw & 0x0400)
+            value = operand;
+        else
+            value = r[operand];
+
+        if (hw & 0x0200)
+            r[destination] = subtract(r[source], value);
+        else
+            r[destination] = add_with_carry(r[source], value, 0);
+
+        return true;
+    }
+
+    if ((hw & 0xe000) == 0x2000) {
+        unsigned operation = (hw >> 11) & 3;
+        unsigned destination = (hw >> 8) & 7;
+        uint32_t value = hw & 0xff;
+
+        if (operation == 0) {
+            r[destination] = value;
+            set_nz(value);
+        }
+        else if (operation == 1) {
+            subtract(r[destination], value);
+        }
+        else if (operation == 2) {
+            r[destination] =
+                add_with_carry(r[destination], value, 0);
+        }
+        else {
+            r[destination] = subtract(r[destination], value);
+        }
+
+        return true;
+    }
+
+    if ((hw & 0xfc00) == 0x4000) {
+        unsigned operation = (hw >> 6) & 15;
+        unsigned source = (hw >> 3) & 7;
+        unsigned destination = hw & 7;
+
+        uint32_t a = r[destination];
+        uint32_t b = r[source];
+
+        if (operation == 0) {
+            r[destination] = a & b;
+            set_nz(r[destination]);
+        }
+        else if (operation == 1) {
+            r[destination] = a ^ b;
+            set_nz(r[destination]);
+        }
+        else if (operation == 2) {
+            r[destination] = shift_value(a, 0, b & 0xff);
+        }
+        else if (operation == 3) {
+            r[destination] = shift_value(a, 1, b & 0xff);
+        }
+        else if (operation == 4) {
+            r[destination] = shift_value(a, 2, b & 0xff);
+        }
+        else if (operation == 5) {
+            r[destination] = add_with_carry(a, b, C);
+        }
+        else if (operation == 6) {
+            r[destination] = add_with_carry(a, ~b, C);
+        }
+        else if (operation == 7) {
+            r[destination] = shift_value(a, 3, b & 0xff);
+        }
+        else if (operation == 8) {
+            set_nz(a & b);
+        }
+        else if (operation == 9) {
+            r[destination] = subtract(0, b);
+        }
+        else if (operation == 10) {
+            subtract(a, b);
+        }
+        else if (operation == 11) {
+            add_with_carry(a, b, 0);
+        }
+        else if (operation == 12) {
+            r[destination] = a | b;
+            set_nz(r[destination]);
+        }
+        else if (operation == 13) {
+            r[destination] = uint32_t(uint64_t(a) * b);
+            set_nz(r[destination]);
+        }
+        else if (operation == 14) {
+            r[destination] = a & ~b;
+            set_nz(r[destination]);
+        }
+        else {
+            r[destination] = ~b;
+            set_nz(r[destination]);
+        }
+
+        return true;
+    }
+
+    if ((hw & 0xfc00) == 0x4400) {
+        unsigned operation = (hw >> 8) & 3;
+        unsigned source = (hw >> 3) & 15;
+        unsigned destination = (hw & 7) | ((hw >> 4) & 8);
+
+        uint32_t a = r[destination];
+        uint32_t b = r[source];
+
+        if (destination == 15)
+            a = pc + 4u;
+
+        if (source == 15)
+            b = pc + 4u;
+
+        if (operation == 3) {
+            if ((hw & 7) != 0)
+                fault("UNDEFINED");
+
+            if ((b & 1) == 0)
+                fault("INVSTATE");
+
+            if (hw & 0x0080)
+                r[14] = (pc + 2u) | 1u;
+
+            next = b & ~1u;
+        }
+        else if (operation == 1) {
+            subtract(a, b);
+        }
+        else {
+            uint32_t result;
+
+            if (operation == 0)
+                result = a + b;
+            else
+                result = b;
+
+            if (destination == 15)
+                next = result & ~1u;
+            else if (destination == 13)
+                r[13] = result & ~3u;
+            else
+                r[destination] = result;
+        }
+
+        return true;
+    }
+
+    if ((hw & 0xf000) == 0xa000) {
+        unsigned destination = (hw >> 8) & 7;
+        uint32_t offset = (hw & 0xff) * 4u;
+        uint32_t base;
+
+        if (hw & 0x0800)
+            base = r[13];
+        else
+            base = (pc + 4u) & ~3u;
+
+        r[destination] = base + offset;
+
+        return true;
+    }
+
+    if ((hw & 0xff00) == 0xb000) {
+        uint32_t offset = (hw & 0x7f) * 4u;
+
+        if (hw & 0x0080)
+            r[13] -= offset;
+        else
+            r[13] += offset;
+
+        r[13] &= ~3u;
+
+        return true;
+    }
+
+    if ((hw & 0xf000) == 0xd000) {
+        unsigned condition = (hw >> 8) & 15;
+
+        if (condition == 15)
+            return false;
+
+        if (condition == 14)
+            fault("UNDEFINED");
+
+        int32_t offset = hw & 0xff;
+
+        if (offset >= 128)
+            offset -= 256;
+
+        if (condition_passed(condition))
+            next = pc + 4u + uint32_t(offset * 2);
+
+        return true;
+    }
+
+    return false;
+}
 // Shared instruction dispatch: Member A and B extend the starter cases.
 void execute_instruction(uint16_t hw, uint16_t hw2, bool wide,
                          uint32_t pc, uint32_t& next)
 {
+        if (execute_b(hw, hw2, wide, pc, next))
+        return;
     if (wide) {
         (void)hw2;
         fault("UNDEFINED"); // Member B TODO: BL
