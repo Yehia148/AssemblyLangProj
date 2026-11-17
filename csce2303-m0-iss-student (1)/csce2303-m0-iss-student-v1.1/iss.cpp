@@ -195,7 +195,8 @@ bool condition_passed(unsigned condition)
         default:
             fault("UNDEFINED");
             return false;
-    }
+    } 
+}
 uint32_t shift_value(uint32_t value, unsigned type, unsigned amount)
 {
     uint32_t result = value;
